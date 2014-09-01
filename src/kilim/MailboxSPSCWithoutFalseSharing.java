@@ -7,13 +7,10 @@
 package kilim;
 
 import java.util.Deque;
-import java.util.NoSuchElementException;
 import java.util.TimerTask;
 import java.util.concurrent.ConcurrentLinkedDeque;
-import java.util.concurrent.locks.LockSupport;
-
-import org.objectweb.asm.tree.IntInsnNode;
-
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * This is a typed buffer that supports single producers and a single consumer.
@@ -27,11 +24,20 @@ import org.objectweb.asm.tree.IntInsnNode;
  * the form of putb(), putnb
  */
 
-public class MailboxMPSC<T> implements PauseReason, EventPublisher {
+public class MailboxSPSCWithoutFalseSharing<T> implements PauseReason, EventPublisher {
     // TODO. Give mbox a config name and id and make monitorable
-    MPSCQueue<T> msgs;
-    VolatileReferenceCell<EventSubscriber> sink = new VolatileReferenceCell<EventSubscriber>();
+    T[] msgs;
+
+    EventSubscriber sink;
     Deque<EventSubscriber> srcs = new ConcurrentLinkedDeque<EventSubscriber>();
+
+    public final AtomicLong tail = new AtomicLong(0L);
+    public final AtomicLong head = new AtomicLong(0L);
+
+   
+    private  long tailCache ;
+    private  long headCache ;
+    private final int mask;
 
     // FIX: I don't like this event design. The only good thing is that
     // we don't create new event objects every time we signal a client
@@ -50,17 +56,77 @@ public class MailboxMPSC<T> implements PauseReason, EventPublisher {
      * public int nPut = 0; public int nGet = 0; public int nWastedPuts = 0;
      * public int nWastedGets = 0;
      */
-    public MailboxMPSC() {
+    public MailboxSPSCWithoutFalseSharing() {
         this(10);
     }
 
     @SuppressWarnings("unchecked")
-    public MailboxMPSC(int initialSize) {
+    public MailboxSPSCWithoutFalseSharing(int initialSize) {
         if (initialSize < 1)
             throw new IllegalArgumentException("initialSize: " + initialSize
                     + " cannot be less then 1");
-        msgs = new MPSCQueue<T>(initialSize);
+        initialSize = findNextPositivePowerOfTwo(initialSize); // Convert
+                                                               // mailbox size
+                                                               // to power of 2
+        msgs = (T[]) new Object[initialSize];
+        mask = initialSize - 1;
+    }
 
+    public static int findNextPositivePowerOfTwo(final int value) {
+        return 1 << (32 - Integer.numberOfLeadingZeros(value - 1));
+    }
+
+    /**
+     * Non-blocking, nonpausing fill.
+     * 
+     * @param eo
+     *            . If non-null, registers this observer and calls it with a
+     *            MessageAvailable event when a put() is done.
+     * @return buffered true if there's one, or up to burst size messages else
+     *         false
+     */
+    public boolean fill(EventSubscriber eo, T[] msg) {
+        int n = msg.length;
+        long currentHead = head.get();
+        if ((currentHead + n) > tailCache) {
+            tailCache = tail.get();
+        }
+        n = (int) Math.min(tailCache - currentHead, n);
+        if (n == 0) {
+            addMsgAvailableListener(eo);
+            return false;
+        }
+        int i = 0;
+        EventSubscriber producer = null;
+        do {
+            final int index = (int) (currentHead++) & mask;
+            msg[i++] = msgs[index];
+            msgs[index] = null;
+        } while (0 != --n);
+        head.lazySet(currentHead);
+        while (srcs.size() > 0) {
+            producer = srcs.poll();
+            if (producer != null) {
+                producer.onEvent(this, spaceAvailble);
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * Pausable fill Pause the caller until at least one message is available.
+     * 
+     * @throws Pausable
+     */
+    public void fill(T[] msg) throws Pausable {
+        Task t = Task.getCurrentTask();
+        boolean b = fill(t, msg);
+        while (!b) {
+            Task.pause(this);
+            removeMsgAvailableListener(t);
+            b = fill(t, msg);
+        }
     }
 
     /**
@@ -71,42 +137,87 @@ public class MailboxMPSC<T> implements PauseReason, EventPublisher {
      *            MessageAvailable event when a put() is done.
      * @return buffered message if there's one, or null
      */
-
-    public T getMsg() {
-        T msg = msgs.poll();
-        return msg;
-    }
-
     public T get(EventSubscriber eo) {
         EventSubscriber producer = null;
-        T e = getMsg();
-        if (e == null) {
-            if (eo != null) {
-                addMsgAvailableListener(eo);
+        T msg = null;
+        final long currentHead = head.get();
+        boolean flag = false;
+        if (currentHead >= tailCache) {
+            tailCache = tail.get();
+            if (currentHead >= tailCache) {
+                msg = null;
+                if (eo != null) {
+                    addMsgAvailableListener(eo);
+                }
+                flag = true;
             }
         }
-
+        if (!flag) {
+            final int index = (int) currentHead & mask;
+            msg = msgs[index];
+            msgs[index] = null;
+            head.lazySet(currentHead + 1);
+        }
+        // if (msg == null) {
         if (srcs.size() > 0) {
             producer = srcs.poll();
         }
         if (producer != null) {
             producer.onEvent(this, spaceAvailble);
         }
-        return e;
+        // }
+        return msg;
     }
 
     /**
-     * Non-blocking, nonpausing put.
-     * 
-     * @param eo
-     *            . If non-null, registers this observer and calls it with an
-     *            SpaceAvailable event when there's space.
-     * @return buffered message if there's one, or null
-     * @see #putnb(Object)
-     * @see #putb(Object)
+     * put a non-null messages from buffer in the mailbox, and pause the calling
+     * task until all the messages put in the mailbox
      */
-    public boolean putMsg(T msg) {
-        return msgs.offer(msg);
+    public void put(T[] buf) throws Pausable {
+        long currentTail = tail.get();
+        int n = buf.length;
+        for (int i = 0; i < n; i++) {
+            if (buf[i] == null) {
+                throw new NullPointerException("Null is not a valid element");
+            }
+        }
+        int count = 0;
+        Task t = Task.getCurrentTask();
+        boolean available = false;
+        EventSubscriber subscriber;
+        while (n != count) {
+            long wrapPoint = currentTail - msgs.length;
+            while (headCache <= wrapPoint) {
+                headCache = head.get();
+                if (headCache <= wrapPoint) {
+                    if (available) {
+                        // we have put atleast one new message so we should wake
+                        // up if someone is waiting for message
+                        tail.lazySet(currentTail);
+                        subscriber = sink;
+                        if (subscriber != null) {
+                            sink=null;
+                            subscriber.onEvent(this, messageAvailable);
+                        }
+                    }
+                    srcs.offer(t);
+                    Task.pause(this);
+                    removeSpaceAvailableListener(t);
+                    available = false;
+
+                }
+            }
+            msgs[(int) (currentTail++) & mask] = buf[count++];
+            available = true;
+        }
+        tail.set(currentTail);
+        // wake up if anybody is waiting for message
+        subscriber = sink;
+        if (subscriber != null) {
+            sink=null;
+            subscriber.onEvent(this, messageAvailable);
+           
+        }
     }
 
     public boolean put(T msg, EventSubscriber eo) {
@@ -114,19 +225,33 @@ public class MailboxMPSC<T> implements PauseReason, EventPublisher {
             throw new NullPointerException("Null is not a valid element");
         }
         EventSubscriber subscriber;
-        boolean b = putMsg(msg);
-        if (!b) {
-            if (eo != null) {
-                srcs.offer(eo);
+        final long currentTail = tail.get();
+        final long wrapPoint = currentTail - msgs.length;
+        if (headCache <= wrapPoint) {
+            headCache = head.get();
+            if (headCache <= wrapPoint) {
+                if (eo != null) {
+                    subscriber = sink;
+                    if (subscriber != null) {
+                        sink=null;
+                        subscriber.onEvent(this, messageAvailable);
+                       
+                    }
+                    srcs.add(eo);
+                }
+                return false;
             }
         }
-        subscriber = sink.get();
-        if (subscriber != null) {
-            removeMsgAvailableListener(subscriber);
-            subscriber.onEvent(this, messageAvailable);
-        }
+        msgs[(int) currentTail & mask] = msg;
+        tail.set(currentTail + 1);
+        subscriber = sink;
 
-        return b;
+        if (subscriber != null) {
+            sink=null;
+            subscriber.onEvent(this, messageAvailable);
+            
+        }
+        return true;
     }
 
     /**
@@ -136,16 +261,6 @@ public class MailboxMPSC<T> implements PauseReason, EventPublisher {
      */
     public T getnb() {
         return get(null);
-    }
-
-    public void fill(T[] buf) {
-
-        for (int i = 0; i < buf.length; i++) {
-            buf[i] = getnb();
-            if (buf[i] == null) {
-                break;
-            }
-        }
     }
 
     /**
@@ -174,8 +289,8 @@ public class MailboxMPSC<T> implements PauseReason, EventPublisher {
         while (msg == null) {
             TimerTask tt = new TimerTask() {
                 public void run() {
-                    MailboxMPSC.this.removeMsgAvailableListener(t);
-                    t.onEvent(MailboxMPSC.this, timedOut);
+                    MailboxSPSCWithoutFalseSharing.this.removeMsgAvailableListener(t);
+                    t.onEvent(MailboxSPSCWithoutFalseSharing.this, timedOut);
                 }
             };
             Task.timer.schedule(tt, timeoutMillis);
@@ -229,8 +344,8 @@ public class MailboxMPSC<T> implements PauseReason, EventPublisher {
         while (has_msg == false) {
             TimerTask tt = new TimerTask() {
                 public void run() {
-                    MailboxMPSC.this.removeMsgAvailableListener(t);
-                    t.onEvent(MailboxMPSC.this, timedOut);
+                    MailboxSPSCWithoutFalseSharing.this.removeMsgAvailableListener(t);
+                    t.onEvent(MailboxSPSCWithoutFalseSharing.this, timedOut);
                 }
             };
             Task.timer.schedule(tt, timeoutMillis);
@@ -264,8 +379,8 @@ public class MailboxMPSC<T> implements PauseReason, EventPublisher {
         while (has_msg == false) {
             TimerTask tt = new TimerTask() {
                 public void run() {
-                    MailboxMPSC.this.removeMsgAvailableListener(t);
-                    t.onEvent(MailboxMPSC.this, timedOut);
+                    MailboxSPSCWithoutFalseSharing.this.removeMsgAvailableListener(t);
+                    t.onEvent(MailboxSPSCWithoutFalseSharing.this, timedOut);
                 }
             };
             Task.timer.schedule(tt, timeoutMillis);
@@ -287,7 +402,7 @@ public class MailboxMPSC<T> implements PauseReason, EventPublisher {
     public boolean hasMessage(Task eo) {
         boolean has_msg;
         synchronized (this) {
-            int n = (int) msgs.size();
+            int n = (int) (tail.get() - head.get());
             if (n > 0) {
                 has_msg = true;
             } else {
@@ -301,7 +416,7 @@ public class MailboxMPSC<T> implements PauseReason, EventPublisher {
     public boolean hasMessages(int num, Task eo) {
         boolean has_msg;
         synchronized (this) {
-            int n = (int) msgs.size();
+            int n = (int) (tail.get() - head.get());
             if (n >= num) {
                 has_msg = true;
             } else {
@@ -318,7 +433,7 @@ public class MailboxMPSC<T> implements PauseReason, EventPublisher {
      * earlier mailbox in the list may also have received a message.
      */
     // TODO: need timeout variant
-    public static int select(MailboxMPSC... mboxes) throws Pausable {
+    public static int select(MailboxSPSCWithoutFalseSharing... mboxes) throws Pausable {
         while (true) {
             for (int i = 0; i < mboxes.length; i++) {
                 if (mboxes[i].hasMessage()) {
@@ -326,7 +441,7 @@ public class MailboxMPSC<T> implements PauseReason, EventPublisher {
                 }
             }
             Task t = Task.getCurrentTask();
-            EmptySet_MsgAvListenerMpSc pauseReason = new EmptySet_MsgAvListenerMpSc(
+            EmptySet_MsgAvListenerSpScWithoutFS pauseReason = new EmptySet_MsgAvListenerSpScWithoutFS(
                     t, mboxes);
             for (int i = 0; i < mboxes.length; i++) {
                 mboxes[i].addMsgAvailableListener(pauseReason);
@@ -338,27 +453,27 @@ public class MailboxMPSC<T> implements PauseReason, EventPublisher {
         }
     }
 
-    public synchronized void addSpaceAvailableListener(EventSubscriber spcSub) {
+    public void addSpaceAvailableListener(EventSubscriber spcSub) {
         srcs.offer(spcSub);
     }
 
-    public synchronized void removeSpaceAvailableListener(EventSubscriber spcSub) {
+    public void removeSpaceAvailableListener(EventSubscriber spcSub) {
         srcs.remove(spcSub);
     }
 
-    public synchronized void addMsgAvailableListener(EventSubscriber msgSub) {
-        EventSubscriber sink1 = sink.get();
+    public void addMsgAvailableListener(EventSubscriber msgSub) {
+        EventSubscriber sink1 = sink;
         if (sink1 != null && sink1 != msgSub) {
             throw new AssertionError(
                     "Error: A mailbox can not be shared by two consumers.  New = "
                             + msgSub + ", Old = " + sink1);
         }
-        sink.set(msgSub);
+        sink=msgSub;
     }
 
-    public synchronized void removeMsgAvailableListener(EventSubscriber msgSub) {
-        if (sink.get() == msgSub) {
-            sink.set(null);
+    public void removeMsgAvailableListener(EventSubscriber msgSub) {
+        if(sink==msgSub){
+            sink=null;
         }
     }
 
@@ -394,8 +509,8 @@ public class MailboxMPSC<T> implements PauseReason, EventPublisher {
         while (!put(msg, t)) {
             TimerTask tt = new TimerTask() {
                 public void run() {
-                    MailboxMPSC.this.removeSpaceAvailableListener(t);
-                    t.onEvent(MailboxMPSC.this, timedOut);
+                    MailboxSPSCWithoutFalseSharing.this.removeSpaceAvailableListener(t);
+                    t.onEvent(MailboxSPSCWithoutFalseSharing.this, timedOut);
                 }
             };
             Task.timer.schedule(tt, timeoutMillis);
@@ -416,9 +531,9 @@ public class MailboxMPSC<T> implements PauseReason, EventPublisher {
         public volatile boolean eventRcvd = false;
 
         public void onEvent(EventPublisher ep, Event e) {
-            synchronized (MailboxMPSC.this) {
+            synchronized (MailboxSPSCWithoutFalseSharing.this) {
                 eventRcvd = true;
-                MailboxMPSC.this.notify();
+                MailboxSPSCWithoutFalseSharing.this.notify();
             }
         }
 
@@ -426,10 +541,10 @@ public class MailboxMPSC<T> implements PauseReason, EventPublisher {
             long start = System.currentTimeMillis();
             long remaining = timeoutMillis;
             boolean infiniteWait = timeoutMillis == 0;
-            synchronized (MailboxMPSC.this) {
+            synchronized (MailboxSPSCWithoutFalseSharing.this) {
                 while (!eventRcvd && (infiniteWait || remaining > 0)) {
                     try {
-                        MailboxMPSC.this.wait(infiniteWait ? 0 : remaining);
+                        MailboxSPSCWithoutFalseSharing.this.wait(infiniteWait ? 0 : remaining);
                     } catch (InterruptedException ie) {
                     }
                     long elapsed = System.currentTimeMillis() - start;
@@ -453,17 +568,18 @@ public class MailboxMPSC<T> implements PauseReason, EventPublisher {
         }
     }
 
-    public int size() {
-        return (int) msgs.size();
-    }
+    // public int size() {
+    // return (int) (tail.get() - head.get());
+    // }
 
     public boolean hasMessage() {
-
-        return (msgs.peek() != null);
+         headCache = head.get();
+        return (msgs[(int) headCache & mask] != null);
     }
 
     public boolean hasSpace() {
-        return msgs.hasSpace();
+        tailCache = tail.get();
+        return (msgs[(int) tailCache & mask] == null);
     }
 
     /**
@@ -506,12 +622,19 @@ public class MailboxMPSC<T> implements PauseReason, EventPublisher {
         // "nPut:" + nPut + " " +
         // "numWastedPuts:" + nWastedPuts + " " +
         // "nWastedGets:" + nWastedGets + " " +
-                "numMsgs:" + msgs.size();
+                "numMsgs:" + (tail.get() - head.get());
+    }
+
+    public void clear() {
+        Object value;
+        do {
+            value = getnb();
+        } while (null != value);
     }
 
     // Implementation of PauseReason
-    public synchronized boolean isValid(Task t) {
-        if (t == sink.get()) {
+    public boolean isValid(Task t) {
+        if (t == sink) {
             return !hasMessage();
         } else if (srcs.contains(t)) {
             return !hasSpace();
@@ -522,11 +645,11 @@ public class MailboxMPSC<T> implements PauseReason, EventPublisher {
 
 }
 
-class EmptySet_MsgAvListenerMpSc implements PauseReason, EventSubscriber {
+class EmptySet_MsgAvListenerSpScWithoutFS implements PauseReason, EventSubscriber {
     final Task task;
-    final MailboxMPSC<?>[] mbxs;
+    final MailboxSPSCWithoutFalseSharing<?>[] mbxs;
 
-    EmptySet_MsgAvListenerMpSc(Task t, MailboxMPSC<?>[] mbs) {
+    EmptySet_MsgAvListenerSpScWithoutFS(Task t, MailboxSPSCWithoutFalseSharing<?>[] mbs) {
         task = t;
         mbxs = mbs;
     }
@@ -534,7 +657,7 @@ class EmptySet_MsgAvListenerMpSc implements PauseReason, EventSubscriber {
     public boolean isValid(Task t) {
         // The pauseReason is true (there is valid reason to continue
         // pausing) if none of the mboxes have any elements
-        for (MailboxMPSC<?> mb : mbxs) {
+        for (MailboxSPSCWithoutFalseSharing<?> mb : mbxs) {
             if (mb.hasMessage())
                 return false;
         }
@@ -542,292 +665,17 @@ class EmptySet_MsgAvListenerMpSc implements PauseReason, EventSubscriber {
     }
 
     public void onEvent(EventPublisher ep, Event e) {
-        for (MailboxMPSC<?> m : mbxs) {
+        for (MailboxSPSCWithoutFalseSharing<?> m : mbxs) {
             if (m != ep) {
-                ((MailboxMPSC<?>) ep).removeMsgAvailableListener(this);
+                ((MailboxSPSCWithoutFalseSharing<?>) ep).removeMsgAvailableListener(this);
             }
         }
         task.resume();
     }
 
     public void cancel() {
-        for (MailboxMPSC<?> mb : mbxs) {
+        for (MailboxSPSCWithoutFalseSharing<?> mb : mbxs) {
             mb.removeMsgAvailableListener(this);
         }
     }
-  
-}
-
-//Referred Nitasan work
-abstract class MPSCQueueL0Pad {
-    public long p00, p01, p02, p03, p04, p05, p06, p07;
-    public long p30, p31, p32, p33, p34, p35, p36, p37;
-}
-
-abstract class MPSCQueueColdFields<E> extends MPSCQueueL0Pad {
-    protected static final int BUFFER_PAD = 64; //to pad queue ends
-    protected static final int SPARSE_SHIFT = Integer.getInteger(
-            "sparse.shift", 0);  //pad each element of queue
-    protected final int capacity;
-    protected final long mask;
-    protected final E[] buffer;
-
-    @SuppressWarnings("unchecked")
-    public MPSCQueueColdFields(int capacity) {
-        if (isPowerOf2(capacity)) {
-            this.capacity = capacity;
-        } else {
-            this.capacity = findNextPositivePowerOfTwo(capacity);
-        }
-        mask = this.capacity - 1;
-        // pad data on either end with some empty slots.
-        buffer = (E[]) new Object[(this.capacity << SPARSE_SHIFT) + BUFFER_PAD
-                * 2];
-    }
-    public static int findNextPositivePowerOfTwo(final int value) {
-        return 1 << (32 - Integer.numberOfLeadingZeros(value - 1));
-    }
-    public static boolean isPowerOf2(final int value){
-        return (value & (value-1)) == 0;
-    }
-}
-abstract class MPSCQueueL1Pad<E> extends MPSCQueueColdFields<E> {
-    public long p10, p11, p12, p13, p14, p15, p16;
-    public long p30, p31, p32, p33, p34, p35, p36, p37;
-
-    public MPSCQueueL1Pad(int capacity) {
-        super(capacity);
-    }
-}
-
-abstract class MPSCQueueTailField<E> extends MPSCQueueL1Pad<E> {
-    protected volatile long tail;
-
-    public MPSCQueueTailField(int capacity) {
-        super(capacity);
-    }
-}
-
-abstract class MPSCQueueL2Pad<E> extends MPSCQueueTailField<E> {
-    public long p20, p21, p22, p23, p24, p25, p26;
-    public long p30, p31, p32, p33, p34, p35, p36, p37;
-
-    public MPSCQueueL2Pad(int capacity) {
-        super(capacity);
-    }
-}
-
-abstract class MPSCQueueHeadField<E> extends MPSCQueueL2Pad<E> {
-    protected long head;
-
-    public MPSCQueueHeadField(int capacity) {
-        super(capacity);
-    }
-}
-
-abstract class MPSCQueueL3Pad<E> extends MPSCQueueHeadField<E> {
-    protected final static long TAIL_OFFSET;
-    protected final static long HEAD_OFFSET;
-    protected static final long ARRAY_BASE;
-    protected static final int ELEMENT_SHIFT;
-    static {
-        try {
-            TAIL_OFFSET = UnsafeAccess.UNSAFE
-                    .objectFieldOffset(MPSCQueueTailField.class
-                            .getDeclaredField("tail"));
-            HEAD_OFFSET = UnsafeAccess.UNSAFE
-                    .objectFieldOffset(MPSCQueueHeadField.class
-                            .getDeclaredField("head"));
-            final int scale = UnsafeAccess.UNSAFE
-                    .arrayIndexScale(Object[].class);
-            if (4 == scale) {
-                ELEMENT_SHIFT = 2 + SPARSE_SHIFT;
-            } else if (8 == scale) {
-                ELEMENT_SHIFT = 3 + SPARSE_SHIFT;
-            } else {
-                throw new IllegalStateException("Unknown pointer size");
-            }
-            // Including the buffer pad in the array base offset
-            ARRAY_BASE = UnsafeAccess.UNSAFE.arrayBaseOffset(Object[].class)
-                    + (BUFFER_PAD << (ELEMENT_SHIFT - SPARSE_SHIFT));
-        } catch (NoSuchFieldException e) {
-            throw new RuntimeException(e);
-        }
-    }
-    public long p40, p41, p42, p43, p44, p45, p46;
-    public long p30, p31, p32, p33, p34, p35, p36, p37;
-
-    public MPSCQueueL3Pad(int capacity) {
-        super(capacity);
-    }
-}
-
-class MPSCQueue<E> extends MPSCQueueL3Pad<E> {
-    private static final BackOffStrategy CAS_BACKOFF = BackOffStrategy
-            .getStrategy("cas.backoff", BackOffStrategy.SPIN); //set property to change backoff strategy
-
-    public MPSCQueue(final int capacity) {
-        super(capacity);
-    }
-
-    private long getHead() {
-        return UnsafeAccess.UNSAFE.getLongVolatile(this, HEAD_OFFSET);
-    }
-
-    private void lazySetHead(long l) {
-        UnsafeAccess.UNSAFE.putOrderedLong(this, HEAD_OFFSET, l);
-    }
-
-    private long getTail() {
-        return UnsafeAccess.UNSAFE.getLongVolatile(this, TAIL_OFFSET);
-    }
-
-    private boolean casTail(long expect, long newValue) {
-        return UnsafeAccess.UNSAFE.compareAndSwapLong(this, TAIL_OFFSET,
-                expect, newValue);
-    }
-
-    public boolean add(final E e) {
-        if (offer(e)) {
-            return true;
-        }
-        throw new IllegalStateException("Queue is full");
-    }
-
-    private long elementOffsetInBuffer(long index) {
-        return ARRAY_BASE + ((index & mask) << ELEMENT_SHIFT);
-    }
-
-    public boolean offer(final E e) {
-        if (null == e) {
-            throw new NullPointerException("Null is not a valid element");
-        }
-
-        long currentTail;
-        for (int missCount = 0;;) {
-            currentTail = getTail();
-            final long wrapPoint = currentTail - capacity;
-            if (getHead() <= wrapPoint) {
-                return false;
-            }
-            if (casTail(currentTail, currentTail + 1)) {
-                break;
-            } else {
-                missCount = CAS_BACKOFF.backoff(missCount);
-
-            }
-        }
-
-        UnsafeAccess.UNSAFE.putOrderedObject(buffer,
-                elementOffsetInBuffer(currentTail), e);
-        return true;
-    }
-
-    public boolean hasSpace() {
-        long currentTail;
-        currentTail = getTail();
-        @SuppressWarnings("unchecked")
-        final E e = (E) UnsafeAccess.UNSAFE.getObjectVolatile(buffer,
-                elementOffsetInBuffer(currentTail));
-        if (e == null) {
-            return true;
-        } else {
-            return false;
-        }
-
-    }
-
-    public E poll() {
-        final long offset = elementOffsetInBuffer(head);
-        @SuppressWarnings("unchecked")
-        final E e = (E) UnsafeAccess.UNSAFE.getObjectVolatile(buffer, offset);
-        if (null == e) {
-            return null;
-        }
-        UnsafeAccess.UNSAFE.putObject(buffer, offset, null);
-        lazySetHead(head + 1);
-        return e;
-    }
-
-    public E remove() {
-        final E e = poll();
-        if (null == e) {
-            throw new NoSuchElementException("Queue is empty");
-        }
-
-        return e;
-    }
-
-    public E element() {
-        final E e = peek();
-        if (null == e) {
-            throw new NoSuchElementException("Queue is empty");
-        }
-
-        return e;
-    }
-
-    public E peek() {
-        long currentHead = getHead();
-        return getElement(currentHead);
-    }
-
-    @SuppressWarnings("unchecked")
-    private E getElement(long index) {
-        return (E) kilim.UnsafeAccess.UNSAFE.getObject(buffer,
-                elementOffsetInBuffer(index));
-    }
-
-    public int size() {
-        long currentConsumerIndexBefore;
-        long currentProducerIndex;
-        long currentConsumerIndexAfter = getHead();
-
-        do {
-            currentConsumerIndexBefore = currentConsumerIndexAfter;
-            currentProducerIndex = getHead();
-            currentConsumerIndexAfter = getTail();
-        } while (currentConsumerIndexBefore != currentConsumerIndexAfter);
-
-        return (int) (currentProducerIndex - currentConsumerIndexBefore);
-
-    }
-    public enum BackOffStrategy {
-        SPIN {
-            public int backoff(int called) {
-                return ++called;
-            }
-        },
-        YIELD{
-            public int backoff(int called) {
-                Thread.yield();
-                return called++;
-            }
-        },
-        PARK{
-            public int backoff(int called) {
-                LockSupport.parkNanos(1);
-                
-                return called++;
-            }
-        },
-        SPIN_YIELD {
-            public int backoff(int called) {
-                if(called>1000)
-                    Thread.yield();
-                return called++;
-                
-            }
-        };
-        public abstract int backoff(int called);
-        public static BackOffStrategy getStrategy(String propertyName, BackOffStrategy defaultS){
-            try{
-                return BackOffStrategy.valueOf(System.getProperty(propertyName));
-            }
-            catch(Exception e){
-                return defaultS;
-            }
-        }
-    }
-    
 }
